@@ -2,3 +2,6 @@ Flask
 gunicorn
 Werkzeug
 pywebpush
+cryptography
+psycopg2-binary
+Pillow

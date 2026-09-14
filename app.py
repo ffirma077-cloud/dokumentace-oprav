@@ -22,9 +22,35 @@ app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 # PUSH NOTIFIKACE
 # ============================================================
 
-VAPID_PRIVATE_KEY = os.path.join(os.path.dirname(__file__), "private_key.pem")
+VAPID_PRIVATE_KEY_FILE = os.path.join(os.path.dirname(__file__), "private_key.pem")
 VAPID_PUBLIC_KEY = os.path.join(os.path.dirname(__file__), "public_key.pem")
 PUSH_SUBSCRIPTIONS_FILE = os.path.join(os.path.dirname(__file__), "push_subscriptions.json")
+
+
+def ziskej_vapid_private_key():
+    """
+    Na Renderu načte privátní klíč z Environment Variable VAPID_PRIVATE_KEY.
+    Na PC použije místní soubor private_key.pem.
+    """
+    env_key = os.environ.get("VAPID_PRIVATE_KEY", "").strip()
+
+    if env_key:
+        # Render může mít klíč uložený s doslovnými \n.
+        env_key = env_key.replace("\\n", "\n")
+
+        # pywebpush spolehlivě pracuje se souborem, proto tajný klíč
+        # pouze dočasně zapíšeme na serveru mimo GitHub.
+        temp_key_path = "/tmp/vapid_private_key.pem"
+
+        with open(temp_key_path, "w", encoding="utf-8") as soubor:
+            soubor.write(env_key)
+
+        return temp_key_path
+
+    if os.path.exists(VAPID_PRIVATE_KEY_FILE):
+        return VAPID_PRIVATE_KEY_FILE
+
+    return None
 
 # Můžeš později změnit v Renderu jako proměnnou prostředí VAPID_SUBJECT.
 VAPID_SUBJECT = os.environ.get("VAPID_SUBJECT", "mailto:admin@example.com")
@@ -66,8 +92,10 @@ def verejny_vapid_klic_base64url():
 
 
 def odesli_push_vsem_ostatnim(nahlasil_login, stroj, zavada):
-    if not os.path.exists(VAPID_PRIVATE_KEY):
-        print("Push přeskočen: chybí private_key.pem")
+    vapid_private_key = ziskej_vapid_private_key()
+
+    if not vapid_private_key:
+        print("Push přeskočen: chybí VAPID_PRIVATE_KEY nebo private_key.pem")
         return
 
     subscriptions = nacti_push_subscriptions()
@@ -100,7 +128,7 @@ def odesli_push_vsem_ostatnim(nahlasil_login, stroj, zavada):
             webpush(
                 subscription_info=subscription,
                 data=json.dumps(payload, ensure_ascii=False),
-                vapid_private_key=VAPID_PRIVATE_KEY,
+                vapid_private_key=vapid_private_key,
                 vapid_claims={"sub": VAPID_SUBJECT}
             )
             platne.append(zaznam)
@@ -573,7 +601,7 @@ def api_push_subscribe():
     nahrazeno = False
 
     for index, zaznam in enumerate(subscriptions):
-        if zaznam.get("subscription", {}).get("endpoint") == endpoint:
+        if zaznam.get("subscription", {{}}).get("endpoint") == endpoint:
             subscriptions[index] = novy_zaznam
             nahrazeno = True
             break
@@ -583,7 +611,7 @@ def api_push_subscribe():
 
     uloz_push_subscriptions(subscriptions)
 
-    return jsonify({"ok": True})
+    return jsonify({{"ok": True}})
 
 
 # ============================================================

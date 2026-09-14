@@ -1,7 +1,7 @@
 self.addEventListener("push", function(event) {
     let data = {
-        title: "🔧 Nová porucha stroje",
-        body: "Byla nahlášena nová porucha.",
+        title: "🔧 Dokumentace oprav",
+        body: "Nové upozornění.",
         url: "/hlavni"
     };
 
@@ -18,39 +18,47 @@ self.addEventListener("push", function(event) {
         data: {
             url: data.url || "/hlavni"
         },
-        tag: "nova-porucha",
+        tag: "dokumentace-oprav-" + Date.now(),
         renotify: true,
         vibrate: [250, 120, 250]
     };
 
     event.waitUntil(
-        self.registration.showNotification(data.title, options)
+        self.registration.showNotification(
+            data.title,
+            options
+        )
     );
 });
 
 
-self.addEventListener("notificationclick", function(event) {
-    event.notification.close();
+self.addEventListener(
+    "notificationclick",
+    function(event) {
+        event.notification.close();
 
-    const cil = event.notification.data && event.notification.data.url
-        ? event.notification.data.url
-        : "/hlavni";
+        const cil =
+            event.notification.data &&
+            event.notification.data.url
+                ? event.notification.data.url
+                : "/hlavni";
 
-    event.waitUntil(
-        clients.matchAll({
-            type: "window",
-            includeUncontrolled: true
-        }).then(function(clientList) {
-            for (const client of clientList) {
-                if ("focus" in client) {
-                    client.navigate(cil);
-                    return client.focus();
+        event.waitUntil(
+            clients.matchAll({
+                type: "window",
+                includeUncontrolled: true
+            }).then(function(clientList) {
+                for (const client of clientList) {
+                    if ("focus" in client) {
+                        client.navigate(cil);
+                        return client.focus();
+                    }
                 }
-            }
 
-            if (clients.openWindow) {
-                return clients.openWindow(cil);
-            }
-        })
-    );
-});
+                if (clients.openWindow) {
+                    return clients.openWindow(cil);
+                }
+            })
+        );
+    }
+);

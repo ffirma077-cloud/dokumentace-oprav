@@ -259,6 +259,106 @@ def url_bezpecne(cil):
     return cil
 
 
+def chybova_stranka(nadpis, zprava, zpet_url="/hlavni", zpet_text="← Zpět"):
+    return f"""
+    <!DOCTYPE html>
+    <html lang="cs">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>{escape(nadpis)}</title>
+        <style>
+            body {{
+                font-family: Arial, sans-serif;
+                background: #f2f2f2;
+                margin: 0;
+                padding: 18px;
+            }}
+            .box {{
+                max-width: 620px;
+                margin: 50px auto;
+                background: white;
+                padding: 28px;
+                border-radius: 15px;
+                box-shadow: 0 3px 15px rgba(0,0,0,0.15);
+                text-align: center;
+            }}
+            .message {{
+                font-size: 18px;
+                line-height: 1.5;
+                margin: 20px 0 28px;
+            }}
+            .btn {{
+                display: block;
+                text-decoration: none;
+                padding: 15px;
+                margin-top: 10px;
+                border-radius: 8px;
+                background: #333;
+                color: white;
+                font-size: 17px;
+            }}
+            .btn.secondary {{
+                background: #e5e5e5;
+                color: #222;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="box">
+            <h1>{escape(nadpis)}</h1>
+            <div class="message">{escape(zprava)}</div>
+            <a class="btn" href="{escape(zpet_url)}">{escape(zpet_text)}</a>
+            <a class="btn secondary" href="/hlavni">🏠 Hlavní stránka</a>
+        </div>
+    </body>
+    </html>
+    """
+
+
+@app.route("/oprava/<int:repair_id>/smazat", methods=["POST"])
+def smazat_opravu(repair_id):
+    if not prihlaseny():
+        return redirect(url_for("prihlaseni"))
+
+    if not je_admin():
+        return chybova_stranka(
+            "⛔ Přístup zamítnut",
+            "Opravu může smazat pouze administrátor.",
+            f"/oprava/{repair_id}",
+            "← Zpět na opravu"
+        ), 403
+
+    oprava = fetch_one(
+        """
+        SELECT id, machine, problem
+        FROM repairs
+        WHERE id = %s
+        """,
+        (repair_id,)
+    )
+
+    if not oprava:
+        return chybova_stranka(
+            "⚠️ Oprava nenalezena",
+            "Tato oprava už neexistuje nebo byla mezitím odstraněna.",
+            "/opravy",
+            "← Zpět na opravy"
+        ), 404
+
+    execute(
+        "DELETE FROM repairs WHERE id = %s",
+        (repair_id,)
+    )
+
+    return chybova_stranka(
+        "✅ Oprava smazána",
+        f"Oprava #{repair_id} – {oprava['machine']} byla trvale odstraněna včetně fotografií a historie.",
+        "/opravy",
+        "← Zpět na opravy"
+    )
+
+
 # ============================================================
 # FOTOGRAFIE
 # ============================================================
@@ -985,7 +1085,12 @@ def nahlasit_opravu():
         provedeno = request.form.get("provedeno", "").strip()
 
         if not stroj or stroj not in STROJE or not zavada:
-            return "Neplatná data formuláře.", 400
+            return chybova_stranka(
+                "⚠️ Neplatná data",
+                "Zkontrolujte vybraný stroj a popis závady.",
+                "/nahlasit-opravu",
+                "← Zpět na formulář"
+            ), 400
 
         row = execute_returning(
             """
@@ -1679,7 +1784,12 @@ def detail_opravy(repair_id):
     )
 
     if not oprava:
-        return "Oprava nebyla nalezena.", 404
+        return chybova_stranka(
+            "⚠️ Oprava nenalezena",
+            "Tato oprava neexistuje nebo už byla odstraněna.",
+            "/opravy",
+            "← Zpět na opravy"
+        ), 404
 
     fotky = fetch_all(
         """
@@ -1783,6 +1893,19 @@ def detail_opravy(repair_id):
             <button class="finish"
                     type="submit">
                 ✅ DOKONČIT OPRAVU
+            </button>
+        </form>
+        """
+
+    delete_html = ""
+
+    if u["role"] == "admin":
+        delete_html = f"""
+        <form method="POST"
+              action="/oprava/{repair_id}/smazat"
+              onsubmit="return confirm('Opravdu chcete tuto opravu trvale smazat? Tím se smažou i fotografie a historie.');">
+            <button class="delete" type="submit">
+                🗑️ SMAZAT OPRAVU
             </button>
         </form>
         """
@@ -1908,6 +2031,12 @@ def detail_opravy(repair_id):
                 color: white;
             }}
 
+            .delete {{
+                background: #b00020;
+                color: white;
+                margin-top: 12px;
+            }}
+
             .back {{
                 display: inline-block;
                 margin-bottom: 12px;
@@ -1971,6 +2100,7 @@ def detail_opravy(repair_id):
 
             <div class="box">
                 {action_html}
+                {delete_html}
             </div>
 
             <div class="box">
@@ -1991,7 +2121,12 @@ def prevzit_opravu(repair_id):
     u = aktualni_uzivatel()
 
     if u["role"] != "udrzbar":
-        return "Pouze údržbář může převzít opravu.", 403
+        return chybova_stranka(
+            "⚠️ Opravu nelze převzít",
+            "Pouze údržbář může převzít opravu.",
+            f"/oprava/{repair_id}",
+            "← Zpět na opravu"
+        ), 403
 
     conn = db_conn()
 
@@ -2020,11 +2155,12 @@ def prevzit_opravu(repair_id):
                 row = cur.fetchone()
 
                 if not row:
-                    return (
-                        "Opravu už někdo převzal "
-                        "nebo neexistuje.",
-                        409
-                    )
+                    return chybova_stranka(
+                        "⚠️ Opravu už nelze převzít",
+                        "Opravu už mezitím převzal někdo jiný, nebo už neexistuje.",
+                        f"/oprava/{repair_id}",
+                        "← Zpět na opravu"
+                    ), 409
 
     finally:
         conn.close()
@@ -2062,7 +2198,12 @@ def dokoncit_opravu(repair_id):
     ).strip()
 
     if not final_work:
-        return "Chybí popis provedené opravy.", 400
+        return chybova_stranka(
+            "⚠️ Chybí popis opravy",
+            "Doplňte prosím, co bylo při opravě provedeno.",
+            f"/oprava/{repair_id}",
+            "← Zpět na opravu"
+        ), 400
 
     oprava = fetch_one(
         """
@@ -2074,16 +2215,31 @@ def dokoncit_opravu(repair_id):
     )
 
     if not oprava:
-        return "Oprava nebyla nalezena.", 404
+        return chybova_stranka(
+            "⚠️ Oprava nenalezena",
+            "Tato oprava neexistuje nebo už byla odstraněna.",
+            "/opravy",
+            "← Zpět na opravy"
+        ), 404
 
     if oprava["status"] != "resi_se":
-        return "Tato oprava není ve stavu Řeší se.", 409
+        return chybova_stranka(
+            "⚠️ Opravu nelze dokončit",
+            "Tato oprava už není ve stavu Řeší se.",
+            f"/oprava/{repair_id}",
+            "← Zpět na opravu"
+        ), 409
 
     if (
         u["role"] != "admin" and
         oprava["assigned_to_login"] != u["login"]
     ):
-        return "Tuto opravu řeší jiný údržbář.", 403
+        return chybova_stranka(
+            "⚠️ Opravu řeší někdo jiný",
+            "Tuto opravu má převzatý jiný údržbář.",
+            f"/oprava/{repair_id}",
+            "← Zpět na opravu"
+        ), 403
 
     execute(
         """
@@ -2275,7 +2431,12 @@ def historie_stroje(nazev):
         return redirect(url_for("prihlaseni"))
 
     if nazev not in STROJE:
-        return "Stroj nebyl nalezen.", 404
+        return chybova_stranka(
+            "⚠️ Stroj nenalezen",
+            "Požadovaný stroj nebyl nalezen.",
+            "/stroje",
+            "← Zpět na stroje"
+        ), 404
 
     rows = fetch_all(
         """

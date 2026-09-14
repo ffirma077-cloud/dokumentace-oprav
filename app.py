@@ -601,7 +601,7 @@ def api_push_subscribe():
     nahrazeno = False
 
     for index, zaznam in enumerate(subscriptions):
-        if zaznam.get("subscription", {{}}).get("endpoint") == endpoint:
+        if zaznam.get("subscription", {}).get("endpoint") == endpoint:
             subscriptions[index] = novy_zaznam
             nahrazeno = True
             break
@@ -611,7 +611,7 @@ def api_push_subscribe():
 
     uloz_push_subscriptions(subscriptions)
 
-    return jsonify({{"ok": True}})
+    return jsonify({"ok": True})
 
 
 # ============================================================

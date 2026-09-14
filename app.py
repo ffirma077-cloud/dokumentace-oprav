@@ -1,155 +1,35 @@
-
-from flask import Flask, request, redirect, url_for, session, send_from_directory, jsonify, send_file
+from flask import Flask, request, redirect, url_for, session, jsonify, send_file, Response
 from datetime import datetime
 from werkzeug.utils import secure_filename
+from html import escape
+from io import BytesIO
 import os
 import uuid
 import json
 import base64
+
+import psycopg2
+import psycopg2.extras
+from PIL import Image
 from pywebpush import webpush, WebPushException
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 
+
 app = Flask(__name__)
-app.secret_key = "docasne-tajne-heslo"
-
-UPLOAD_FOLDER = "fotografie_oprav"
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
+app.secret_key = os.environ.get("FLASK_SECRET_KEY", "docasne-tajne-heslo")
 
 
 # ============================================================
-# PUSH NOTIFIKACE
+# NASTAVENÍ
 # ============================================================
+
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 
 VAPID_PRIVATE_KEY_FILE = os.path.join(os.path.dirname(__file__), "private_key.pem")
 VAPID_PUBLIC_KEY = os.path.join(os.path.dirname(__file__), "public_key.pem")
-PUSH_SUBSCRIPTIONS_FILE = os.path.join(os.path.dirname(__file__), "push_subscriptions.json")
-
-
-def ziskej_vapid_private_key():
-    """
-    Na Renderu načte privátní klíč z Environment Variable VAPID_PRIVATE_KEY.
-    Na PC použije místní soubor private_key.pem.
-    """
-    env_key = os.environ.get("VAPID_PRIVATE_KEY", "").strip()
-
-    if env_key:
-        # Render může mít klíč uložený s doslovnými \n.
-        env_key = env_key.replace("\\n", "\n")
-
-        # pywebpush spolehlivě pracuje se souborem, proto tajný klíč
-        # pouze dočasně zapíšeme na serveru mimo GitHub.
-        temp_key_path = "/tmp/vapid_private_key.pem"
-
-        with open(temp_key_path, "w", encoding="utf-8") as soubor:
-            soubor.write(env_key)
-
-        return temp_key_path
-
-    if os.path.exists(VAPID_PRIVATE_KEY_FILE):
-        return VAPID_PRIVATE_KEY_FILE
-
-    return None
-
-# Můžeš později změnit v Renderu jako proměnnou prostředí VAPID_SUBJECT.
 VAPID_SUBJECT = os.environ.get("VAPID_SUBJECT", "mailto:admin@example.com")
 
-
-def nacti_push_subscriptions():
-    if not os.path.exists(PUSH_SUBSCRIPTIONS_FILE):
-        return []
-
-    try:
-        with open(PUSH_SUBSCRIPTIONS_FILE, "r", encoding="utf-8") as soubor:
-            data = json.load(soubor)
-            return data if isinstance(data, list) else []
-    except (OSError, json.JSONDecodeError):
-        return []
-
-
-def uloz_push_subscriptions(data):
-    with open(PUSH_SUBSCRIPTIONS_FILE, "w", encoding="utf-8") as soubor:
-        json.dump(data, soubor, ensure_ascii=False, indent=2)
-
-
-def verejny_vapid_klic_base64url():
-    if not os.path.exists(VAPID_PUBLIC_KEY):
-        raise FileNotFoundError("Chybí public_key.pem")
-
-    with open(VAPID_PUBLIC_KEY, "rb") as soubor:
-        public_key = serialization.load_pem_public_key(soubor.read())
-
-    if not isinstance(public_key, ec.EllipticCurvePublicKey):
-        raise ValueError("Veřejný VAPID klíč není EC klíč.")
-
-    raw_key = public_key.public_bytes(
-        encoding=serialization.Encoding.X962,
-        format=serialization.PublicFormat.UncompressedPoint
-    )
-
-    return base64.urlsafe_b64encode(raw_key).rstrip(b"=").decode("ascii")
-
-
-def odesli_push_vsem_ostatnim(nahlasil_login, stroj, zavada):
-    vapid_private_key = ziskej_vapid_private_key()
-
-    if not vapid_private_key:
-        print("Push přeskočen: chybí VAPID_PRIVATE_KEY nebo private_key.pem")
-        return
-
-    subscriptions = nacti_push_subscriptions()
-
-    if not subscriptions:
-        print("Push přeskočen: zatím není registrován žádný telefon.")
-        return
-
-    payload = {
-        "title": "🔧 Nová porucha stroje",
-        "body": f"{stroj}: {zavada[:140]}",
-        "url": "/hlavni"
-    }
-
-    platne = []
-
-    for zaznam in subscriptions:
-        subscription = zaznam.get("subscription")
-        login = zaznam.get("uzivatel")
-
-        if not subscription:
-            continue
-
-        # Uživateli, který závadu nahlásil, ji neposíláme.
-        if login == nahlasil_login:
-            platne.append(zaznam)
-            continue
-
-        try:
-            webpush(
-                subscription_info=subscription,
-                data=json.dumps(payload, ensure_ascii=False),
-                vapid_private_key=vapid_private_key,
-                vapid_claims={"sub": VAPID_SUBJECT}
-            )
-            platne.append(zaznam)
-
-        except WebPushException as exc:
-            status = getattr(getattr(exc, "response", None), "status_code", None)
-
-            # 404/410 = odběr už na push serveru neexistuje.
-            if status in (404, 410):
-                print("Odstraňuji neplatné push přihlášení:", login)
-            else:
-                print("Chyba při odesílání push:", exc)
-                platne.append(zaznam)
-
-    if len(platne) != len(subscriptions):
-        uloz_push_subscriptions(platne)
-
-
-# ============================================================
-# UŽIVATELÉ
-# ============================================================
 
 UZIVATELE = {
     "jiri": {
@@ -175,10 +55,6 @@ UZIVATELE = {
 }
 
 
-# ============================================================
-# STROJE
-# ============================================================
-
 STROJE = [
     "Linka",
     "Odformovací linka",
@@ -188,25 +64,445 @@ STROJE = [
 ]
 
 
+STAVY = {
+    "nova": ("🔴", "Nová"),
+    "resi_se": ("🟠", "Řeší se"),
+    "hotovo": ("🟢", "Hotovo")
+}
+
+
+# ============================================================
+# DATABÁZE
+# ============================================================
+
+def db_conn():
+    if not DATABASE_URL:
+        raise RuntimeError(
+            "Chybí DATABASE_URL. Na Renderu ji nastav v Environment Variables."
+        )
+
+    return psycopg2.connect(
+        DATABASE_URL,
+        cursor_factory=psycopg2.extras.RealDictCursor
+    )
+
+
+def init_db():
+    if not DATABASE_URL:
+        print("DATABASE_URL není nastavená - databáze se neinicializovala.")
+        return
+
+    conn = db_conn()
+
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS repairs (
+                        id BIGSERIAL PRIMARY KEY,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        machine TEXT NOT NULL,
+                        problem TEXT NOT NULL,
+                        initial_work TEXT,
+                        status TEXT NOT NULL DEFAULT 'nova',
+                        reported_by_login TEXT NOT NULL,
+                        reported_by_name TEXT NOT NULL,
+                        assigned_to_login TEXT,
+                        assigned_to_name TEXT,
+                        assigned_at TIMESTAMPTZ,
+                        completed_at TIMESTAMPTZ,
+                        final_work TEXT
+                    )
+                """)
+
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS repair_photos (
+                        id BIGSERIAL PRIMARY KEY,
+                        repair_id BIGINT NOT NULL REFERENCES repairs(id) ON DELETE CASCADE,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        phase TEXT NOT NULL DEFAULT 'zavada',
+                        filename TEXT,
+                        mime_type TEXT NOT NULL DEFAULT 'image/jpeg',
+                        data BYTEA NOT NULL
+                    )
+                """)
+
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS repair_events (
+                        id BIGSERIAL PRIMARY KEY,
+                        repair_id BIGINT NOT NULL REFERENCES repairs(id) ON DELETE CASCADE,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        user_login TEXT NOT NULL,
+                        user_name TEXT NOT NULL,
+                        event_type TEXT NOT NULL,
+                        note TEXT
+                    )
+                """)
+
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS push_subscriptions (
+                        id BIGSERIAL PRIMARY KEY,
+                        user_login TEXT NOT NULL,
+                        endpoint TEXT NOT NULL UNIQUE,
+                        subscription_json JSONB NOT NULL,
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                """)
+
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_repairs_status
+                    ON repairs(status)
+                """)
+
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_repairs_machine
+                    ON repairs(machine)
+                """)
+
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_repairs_assigned
+                    ON repairs(assigned_to_login)
+                """)
+
+    finally:
+        conn.close()
+
+
+def fetch_all(query, params=()):
+    conn = db_conn()
+
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(query, params)
+                return cur.fetchall()
+    finally:
+        conn.close()
+
+
+def fetch_one(query, params=()):
+    conn = db_conn()
+
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(query, params)
+                return cur.fetchone()
+    finally:
+        conn.close()
+
+
+def execute_returning(query, params=()):
+    conn = db_conn()
+
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(query, params)
+                row = cur.fetchone()
+                return row
+    finally:
+        conn.close()
+
+
+def execute(query, params=()):
+    conn = db_conn()
+
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(query, params)
+    finally:
+        conn.close()
+
+
+# ============================================================
+# POMOCNÉ FUNKCE
+# ============================================================
+
+def prihlaseny():
+    return session.get("uzivatel") in UZIVATELE
+
+
+def aktualni_uzivatel():
+    login = session.get("uzivatel")
+
+    if login not in UZIVATELE:
+        return None
+
+    data = dict(UZIVATELE[login])
+    data["login"] = login
+    return data
+
+
+def je_admin():
+    u = aktualni_uzivatel()
+    return bool(u and u["role"] == "admin")
+
+
+def format_datum(value):
+    if not value:
+        return "—"
+
+    return value.astimezone().strftime("%d.%m.%Y %H:%M")
+
+
+def stav_html(status):
+    ikona, text = STAVY.get(status, ("⚪", status))
+    return f"{ikona} {escape(text)}"
+
+
+def url_bezpecne(cil):
+    if not cil or not cil.startswith("/"):
+        return "/hlavni"
+
+    return cil
+
+
+# ============================================================
+# FOTOGRAFIE
+# ============================================================
+
+def zpracuj_fotografii(file_storage):
+    """
+    Fotku zmenší na max. 1600 px a uloží jako JPEG.
+    Tím výrazně šetříme místo v DB.
+    """
+    raw = file_storage.read()
+
+    if not raw:
+        return None
+
+    try:
+        image = Image.open(BytesIO(raw))
+        image = image.convert("RGB")
+        image.thumbnail((1600, 1600))
+
+        output = BytesIO()
+        image.save(
+            output,
+            format="JPEG",
+            quality=82,
+            optimize=True
+        )
+
+        return {
+            "filename": secure_filename(file_storage.filename or "foto.jpg"),
+            "mime_type": "image/jpeg",
+            "data": output.getvalue()
+        }
+
+    except Exception as exc:
+        print("Fotografii se nepodařilo zpracovat:", exc)
+        return None
+
+
+def uloz_fotky(repair_id, files, phase="zavada"):
+    conn = db_conn()
+
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                for soubor in files:
+                    if not soubor or not soubor.filename:
+                        continue
+
+                    photo = zpracuj_fotografii(soubor)
+
+                    if not photo:
+                        continue
+
+                    cur.execute(
+                        """
+                        INSERT INTO repair_photos
+                            (repair_id, phase, filename, mime_type, data)
+                        VALUES (%s, %s, %s, %s, %s)
+                        """,
+                        (
+                            repair_id,
+                            phase,
+                            photo["filename"],
+                            photo["mime_type"],
+                            psycopg2.Binary(photo["data"])
+                        )
+                    )
+    finally:
+        conn.close()
+
+
+def pridej_event(repair_id, event_type, note=""):
+    u = aktualni_uzivatel()
+
+    if not u:
+        return
+
+    execute(
+        """
+        INSERT INTO repair_events
+            (repair_id, user_login, user_name, event_type, note)
+        VALUES (%s, %s, %s, %s, %s)
+        """,
+        (
+            repair_id,
+            u["login"],
+            u["jmeno"],
+            event_type,
+            note
+        )
+    )
+
+
+# ============================================================
+# PUSH NOTIFIKACE
+# ============================================================
+
+def ziskej_vapid_private_key():
+    env_key = os.environ.get("VAPID_PRIVATE_KEY", "").strip()
+
+    if env_key:
+        env_key = env_key.replace("\\n", "\n")
+        temp_key_path = "/tmp/vapid_private_key.pem"
+
+        with open(temp_key_path, "w", encoding="utf-8") as soubor:
+            soubor.write(env_key)
+
+        return temp_key_path
+
+    if os.path.exists(VAPID_PRIVATE_KEY_FILE):
+        return VAPID_PRIVATE_KEY_FILE
+
+    return None
+
+
+def verejny_vapid_klic_base64url():
+    if not os.path.exists(VAPID_PUBLIC_KEY):
+        raise FileNotFoundError("Chybí public_key.pem")
+
+    with open(VAPID_PUBLIC_KEY, "rb") as soubor:
+        public_key = serialization.load_pem_public_key(soubor.read())
+
+    if not isinstance(public_key, ec.EllipticCurvePublicKey):
+        raise ValueError("Veřejný VAPID klíč není EC klíč.")
+
+    raw_key = public_key.public_bytes(
+        encoding=serialization.Encoding.X962,
+        format=serialization.PublicFormat.UncompressedPoint
+    )
+
+    return base64.urlsafe_b64encode(raw_key).rstrip(b"=").decode("ascii")
+
+
+def push_subscriptions():
+    return fetch_all(
+        """
+        SELECT user_login, endpoint, subscription_json
+        FROM push_subscriptions
+        """
+    )
+
+
+def uloz_push_subscription(user_login, subscription):
+    endpoint = subscription.get("endpoint")
+
+    execute(
+        """
+        INSERT INTO push_subscriptions
+            (user_login, endpoint, subscription_json, updated_at)
+        VALUES (%s, %s, %s::jsonb, NOW())
+        ON CONFLICT (endpoint)
+        DO UPDATE SET
+            user_login = EXCLUDED.user_login,
+            subscription_json = EXCLUDED.subscription_json,
+            updated_at = NOW()
+        """,
+        (
+            user_login,
+            endpoint,
+            json.dumps(subscription)
+        )
+    )
+
+
+def odesli_push(
+    title,
+    body,
+    url="/hlavni",
+    exclude_login=None,
+    only_login=None
+):
+    vapid_private_key = ziskej_vapid_private_key()
+
+    if not vapid_private_key:
+        print("Push přeskočen: chybí privátní VAPID klíč.")
+        return
+
+    try:
+        subscriptions = push_subscriptions()
+    except Exception as exc:
+        print("Push subscriptions nelze načíst:", exc)
+        return
+
+    payload = {
+        "title": title,
+        "body": body[:180],
+        "url": url_bezpecne(url)
+    }
+
+    for zaznam in subscriptions:
+        login = zaznam["user_login"]
+
+        if exclude_login and login == exclude_login:
+            continue
+
+        if only_login and login != only_login:
+            continue
+
+        subscription = zaznam["subscription_json"]
+
+        if isinstance(subscription, str):
+            subscription = json.loads(subscription)
+
+        try:
+            webpush(
+                subscription_info=subscription,
+                data=json.dumps(payload, ensure_ascii=False),
+                vapid_private_key=vapid_private_key,
+                vapid_claims={"sub": VAPID_SUBJECT}
+            )
+
+        except WebPushException as exc:
+            status = getattr(
+                getattr(exc, "response", None),
+                "status_code",
+                None
+            )
+
+            print("Chyba push:", login, status, exc)
+
+            if status in (404, 410):
+                execute(
+                    "DELETE FROM push_subscriptions WHERE endpoint = %s",
+                    (zaznam["endpoint"],)
+                )
+
+
 # ============================================================
 # PŘIHLÁŠENÍ
 # ============================================================
 
 @app.route("/", methods=["GET", "POST"])
 def prihlaseni():
-
-    if "uzivatel" in session:
+    if prihlaseny():
         return redirect(url_for("hlavni_stranka"))
 
     chyba = ""
 
     if request.method == "POST":
+        login = request.form.get("uzivatel", "").strip()
+        heslo = request.form.get("heslo", "")
 
-        uzivatel = request.form.get("uzivatel")
-        heslo = request.form.get("heslo")
-
-        if uzivatel in UZIVATELE and UZIVATELE[uzivatel]["heslo"] == heslo:
-            session["uzivatel"] = uzivatel
+        if login in UZIVATELE and UZIVATELE[login]["heslo"] == heslo:
+            session["uzivatel"] = login
             return redirect(url_for("hlavni_stranka"))
 
         chyba = "Nesprávné uživatelské jméno nebo heslo."
@@ -215,16 +511,12 @@ def prihlaseni():
     <!DOCTYPE html>
     <html lang="cs">
     <head>
-
         <meta charset="UTF-8">
-
         <meta name="viewport"
               content="width=device-width, initial-scale=1.0">
-
         <title>Dokumentace oprav</title>
 
         <style>
-
             body {{
                 font-family: Arial, sans-serif;
                 background: #f2f2f2;
@@ -233,7 +525,7 @@ def prihlaseni():
             }}
 
             .box {{
-                max-width: 400px;
+                max-width: 420px;
                 margin: 60px auto;
                 background: white;
                 padding: 30px;
@@ -252,6 +544,8 @@ def prihlaseni():
                 margin: 8px 0 15px 0;
                 box-sizing: border-box;
                 font-size: 16px;
+                border: 1px solid #bbb;
+                border-radius: 8px;
             }}
 
             button {{
@@ -266,27 +560,20 @@ def prihlaseni():
             }}
 
             .chyba {{
-                color: red;
+                color: #b00020;
                 text-align: center;
                 margin-bottom: 15px;
             }}
-
         </style>
-
     </head>
 
     <body>
-
         <div class="box">
-
             <h1>Dokumentace oprav</h1>
+            <div class="chyba">{escape(chyba)}</div>
 
-            <div class="chyba">{chyba}</div>
-
-            <form method="POST" enctype="multipart/form-data">
-
+            <form method="POST">
                 <label>Uživatel</label>
-
                 <input
                     type="text"
                     name="uzivatel"
@@ -295,7 +582,6 @@ def prihlaseni():
                 >
 
                 <label>Heslo</label>
-
                 <input
                     type="password"
                     name="heslo"
@@ -306,11 +592,8 @@ def prihlaseni():
                 <button type="submit">
                     PŘIHLÁSIT
                 </button>
-
             </form>
-
         </div>
-
     </body>
     </html>
     """
@@ -322,97 +605,136 @@ def prihlaseni():
 
 @app.route("/hlavni")
 def hlavni_stranka():
-
-    if "uzivatel" not in session:
+    if not prihlaseny():
         return redirect(url_for("prihlaseni"))
 
-    uzivatel = UZIVATELE[session["uzivatel"]]
+    u = aktualni_uzivatel()
 
-    if uzivatel["role"] == "admin":
+    try:
+        counts = fetch_one("""
+            SELECT
+                COUNT(*) FILTER (WHERE status = 'nova') AS nova,
+                COUNT(*) FILTER (WHERE status = 'resi_se') AS resi_se,
+                COUNT(*) FILTER (WHERE status = 'hotovo') AS hotovo
+            FROM repairs
+        """)
 
-        obsah = """
-        <h2>Přehled oprav</h2>
+        nova = counts["nova"] or 0
+        resi = counts["resi_se"] or 0
+        hotovo = counts["hotovo"] or 0
 
-        <p>Zde později uvidíš všechny nahlášené opravy.</p>
+    except Exception as exc:
+        nova = resi = hotovo = 0
+        print("Chyba při načítání počtů:", exc)
 
-        <button>VŠECHNY OPRAVY</button>
-        <button>STROJE</button>
-        <button>HISTORIE</button>
+    if u["role"] == "admin":
+        obsah = f"""
+            <h2>Přehled oprav</h2>
+
+            <div class="stat-grid">
+                <div class="stat"><strong>🔴 {nova}</strong><span>Nové</span></div>
+                <div class="stat"><strong>🟠 {resi}</strong><span>Řeší se</span></div>
+                <div class="stat"><strong>🟢 {hotovo}</strong><span>Hotovo</span></div>
+            </div>
+
+            <a href="/opravy"><button>📋 VŠECHNY OPRAVY</button></a>
+            <a href="/stroje"><button>🏭 STROJE A HISTORIE</button></a>
         """
-
     else:
+        obsah = f"""
+            <h2>Údržba</h2>
 
-        obsah = """
-        <h2>Údržba</h2>
+            <div class="stat-grid">
+                <div class="stat"><strong>🔴 {nova}</strong><span>Nové</span></div>
+                <div class="stat"><strong>🟠 {resi}</strong><span>Řeší se</span></div>
+                <div class="stat"><strong>🟢 {hotovo}</strong><span>Hotovo</span></div>
+            </div>
 
-        <a href="/nahlasit-opravu">
-            <button>🔧 NAHLÁSIT OPRAVU</button>
-        </a>
+            <a href="/nahlasit-opravu">
+                <button>🔧 NAHLÁSIT OPRAVU</button>
+            </a>
 
-        <button>MOJE OPRAVY</button>
+            <a href="/opravy">
+                <button>📋 AKTUÁLNÍ OPRAVY</button>
+            </a>
+
+            <a href="/moje-opravy">
+                <button>👨‍🔧 MOJE OPRAVY</button>
+            </a>
         """
 
     return f"""
     <!DOCTYPE html>
     <html lang="cs">
-
     <head>
-
         <meta charset="UTF-8">
-
         <meta name="viewport"
               content="width=device-width, initial-scale=1.0">
-
         <title>Dokumentace oprav</title>
 
         <style>
-
             body {{
                 font-family: Arial, sans-serif;
                 background: #f2f2f2;
                 margin: 0;
-                padding: 20px;
+                padding: 18px;
             }}
 
             .box {{
-                max-width: 700px;
-                margin: 30px auto;
+                max-width: 760px;
+                margin: 20px auto;
                 background: white;
-                padding: 30px;
+                padding: 26px;
                 border-radius: 15px;
                 box-shadow: 0 3px 15px rgba(0,0,0,0.15);
             }}
 
-            h1 {{
-                margin-bottom: 5px;
-            }}
+            h1 {{ margin-bottom: 5px; }}
+            h2 {{ margin-top: 28px; }}
 
-            h2 {{
-                margin-top: 35px;
-            }}
+            a {{ text-decoration: none; }}
 
             button {{
                 width: 100%;
                 padding: 16px;
-                margin: 8px 0;
+                margin: 7px 0;
                 font-size: 17px;
                 border: none;
                 border-radius: 8px;
                 cursor: pointer;
             }}
 
-            .logout {{
-                background: #ddd;
+            .logout {{ background: #ddd; }}
+
+            .stat-grid {{
+                display: grid;
+                grid-template-columns: repeat(3, 1fr);
+                gap: 10px;
+                margin: 18px 0;
+            }}
+
+            .stat {{
+                background: #f6f6f6;
+                border-radius: 10px;
+                padding: 14px 8px;
+                text-align: center;
+            }}
+
+            .stat strong {{
+                display: block;
+                font-size: 22px;
+            }}
+
+            .stat span {{
+                display: block;
+                margin-top: 5px;
+                font-size: 13px;
             }}
 
             .notifikace-box {{
                 margin-top: 25px;
                 padding-top: 20px;
                 border-top: 1px solid #ddd;
-            }}
-
-            .notifikace-box h3 {{
-                margin-bottom: 10px;
             }}
 
             #povolit-notifikace {{
@@ -427,31 +749,29 @@ def hlavni_stranka():
                 font-size: 14px;
                 text-align: center;
             }}
-
         </style>
-
     </head>
 
     <body>
-
         <div class="box">
-
             <h1>Dokumentace oprav</h1>
 
             <p>
                 Přihlášen:
-                <strong>{uzivatel["jmeno"]}</strong>
+                <strong>{escape(u["jmeno"])}</strong>
             </p>
-
 
             {obsah}
 
             <div class="notifikace-box">
                 <h3>🔔 Upozornění na poruchy</h3>
+
                 <button id="povolit-notifikace" type="button">
                     🔔 POVOLIT UPOZORNĚNÍ
                 </button>
-                <div id="notifikace-stav" class="notifikace-stav"></div>
+
+                <div id="notifikace-stav"
+                     class="notifikace-stav"></div>
             </div>
 
             <hr>
@@ -461,7 +781,6 @@ def hlavni_stranka():
                     ODHLÁSIT
                 </button>
             </a>
-
         </div>
 
         <script>
@@ -472,15 +791,27 @@ def hlavni_stranka():
                     .replace(/_/g, "/");
 
                 const rawData = window.atob(base64);
-                return Uint8Array.from([...rawData].map(char => char.charCodeAt(0)));
+
+                return Uint8Array.from(
+                    [...rawData].map(
+                        char => char.charCodeAt(0)
+                    )
+                );
             }}
 
             async function registrovatPush() {{
-                const tlacitko = document.getElementById("povolit-notifikace");
-                const stav = document.getElementById("notifikace-stav");
+                const tlacitko =
+                    document.getElementById("povolit-notifikace");
 
-                if (!("serviceWorker" in navigator) || !("PushManager" in window)) {{
-                    stav.textContent = "⚠️ Tento prohlížeč push upozornění nepodporuje.";
+                const stav =
+                    document.getElementById("notifikace-stav");
+
+                if (
+                    !("serviceWorker" in navigator) ||
+                    !("PushManager" in window)
+                ) {{
+                    stav.textContent =
+                        "⚠️ Tento prohlížeč push upozornění nepodporuje.";
                     return;
                 }}
 
@@ -488,52 +819,75 @@ def hlavni_stranka():
                     tlacitko.disabled = true;
                     stav.textContent = "Připravuji upozornění...";
 
-                    const registration = await navigator.serviceWorker.register("/service-worker.js");
+                    const registration =
+                        await navigator.serviceWorker.register(
+                            "/service-worker.js"
+                        );
 
                     let permission = Notification.permission;
 
                     if (permission !== "granted") {{
-                        permission = await Notification.requestPermission();
+                        permission =
+                            await Notification.requestPermission();
                     }}
 
                     if (permission !== "granted") {{
-                        stav.textContent = "⚠️ Upozornění nebyla povolena.";
+                        stav.textContent =
+                            "⚠️ Upozornění nebyla povolena.";
                         tlacitko.disabled = false;
                         return;
                     }}
 
-                    const keyResponse = await fetch("/api/vapid-public-key");
-                    const keyData = await keyResponse.json();
+                    const keyResponse =
+                        await fetch("/api/vapid-public-key");
+
+                    const keyData =
+                        await keyResponse.json();
 
                     if (!keyResponse.ok) {{
-                        throw new Error(keyData.error || "Nepodařilo se načíst VAPID klíč.");
+                        throw new Error(
+                            keyData.error ||
+                            "Nepodařilo se načíst VAPID klíč."
+                        );
                     }}
 
-                    let subscription = await registration.pushManager.getSubscription();
+                    let subscription =
+                        await registration.pushManager.getSubscription();
 
                     if (!subscription) {{
-                        subscription = await registration.pushManager.subscribe({{
-                            userVisibleOnly: true,
-                            applicationServerKey: urlBase64ToUint8Array(keyData.publicKey)
-                        }});
+                        subscription =
+                            await registration.pushManager.subscribe({{
+                                userVisibleOnly: true,
+                                applicationServerKey:
+                                    urlBase64ToUint8Array(
+                                        keyData.publicKey
+                                    )
+                            }});
                     }}
 
-                    const response = await fetch("/api/push/subscribe", {{
-                        method: "POST",
-                        headers: {{
-                            "Content-Type": "application/json"
-                        }},
-                        body: JSON.stringify(subscription)
-                    }});
+                    const response =
+                        await fetch("/api/push/subscribe", {{
+                            method: "POST",
+                            headers: {{
+                                "Content-Type": "application/json"
+                            }},
+                            body: JSON.stringify(subscription)
+                        }});
 
                     const data = await response.json();
 
                     if (!response.ok) {{
-                        throw new Error(data.error || "Registrace telefonu selhala.");
+                        throw new Error(
+                            data.error ||
+                            "Registrace telefonu selhala."
+                        );
                     }}
 
-                    stav.textContent = "✅ Upozornění jsou na tomto zařízení povolena.";
-                    tlacitko.textContent = "✅ UPOZORNĚNÍ POVOLENA";
+                    stav.textContent =
+                        "✅ Upozornění jsou na tomto zařízení povolena.";
+
+                    tlacitko.textContent =
+                        "✅ UPOZORNĚNÍ POVOLENA";
 
                 }} catch (error) {{
                     console.error(error);
@@ -542,17 +896,24 @@ def hlavni_stranka():
                 }}
             }}
 
-            document.getElementById("povolit-notifikace")
-                .addEventListener("click", registrovatPush);
+            document
+                .getElementById("povolit-notifikace")
+                .addEventListener(
+                    "click",
+                    registrovatPush
+                );
 
-            if (Notification.permission === "granted") {{
-                document.getElementById("notifikace-stav").textContent =
+            if (
+                "Notification" in window &&
+                Notification.permission === "granted"
+            ) {{
+                document.getElementById(
+                    "notifikace-stav"
+                ).textContent =
                     "Upozornění už byla v tomto prohlížeči povolena.";
             }}
         </script>
-
     </body>
-
     </html>
     """
 
@@ -564,52 +925,45 @@ def hlavni_stranka():
 @app.route("/service-worker.js")
 def service_worker():
     return send_file(
-        os.path.join(os.path.dirname(__file__), "service-worker.js"),
+        os.path.join(
+            os.path.dirname(__file__),
+            "service-worker.js"
+        ),
         mimetype="application/javascript"
     )
 
 
 @app.route("/api/vapid-public-key")
 def api_vapid_public_key():
-    if "uzivatel" not in session:
+    if not prihlaseny():
         return jsonify({"error": "Nejste přihlášen."}), 401
 
     try:
-        return jsonify({"publicKey": verejny_vapid_klic_base64url()})
+        return jsonify({
+            "publicKey":
+                verejny_vapid_klic_base64url()
+        })
+
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
 
 
 @app.route("/api/push/subscribe", methods=["POST"])
 def api_push_subscribe():
-    if "uzivatel" not in session:
+    if not prihlaseny():
         return jsonify({"error": "Nejste přihlášen."}), 401
 
     subscription = request.get_json(silent=True)
 
     if not subscription or not subscription.get("endpoint"):
-        return jsonify({"error": "Neplatná registrace telefonu."}), 400
+        return jsonify({
+            "error": "Neplatná registrace telefonu."
+        }), 400
 
-    subscriptions = nacti_push_subscriptions()
-    endpoint = subscription["endpoint"]
-
-    novy_zaznam = {
-        "uzivatel": session["uzivatel"],
-        "subscription": subscription
-    }
-
-    nahrazeno = False
-
-    for index, zaznam in enumerate(subscriptions):
-        if zaznam.get("subscription", {}).get("endpoint") == endpoint:
-            subscriptions[index] = novy_zaznam
-            nahrazeno = True
-            break
-
-    if not nahrazeno:
-        subscriptions.append(novy_zaznam)
-
-    uloz_push_subscriptions(subscriptions)
+    uloz_push_subscription(
+        session["uzivatel"],
+        subscription
+    )
 
     return jsonify({"ok": True})
 
@@ -620,155 +974,78 @@ def api_push_subscribe():
 
 @app.route("/nahlasit-opravu", methods=["GET", "POST"])
 def nahlasit_opravu():
-
-    if "uzivatel" not in session:
+    if not prihlaseny():
         return redirect(url_for("prihlaseni"))
 
-    uzivatel = UZIVATELE[session["uzivatel"]]
+    u = aktualni_uzivatel()
 
     if request.method == "POST":
+        stroj = request.form.get("stroj", "").strip()
+        zavada = request.form.get("zavada", "").strip()
+        provedeno = request.form.get("provedeno", "").strip()
 
-        stroj = request.form.get("stroj")
-        zavada = request.form.get("zavada")
-        provedeno = request.form.get("provedeno")
+        if not stroj or stroj not in STROJE or not zavada:
+            return "Neplatná data formuláře.", 400
 
-        datum = datetime.now().strftime("%d.%m.%Y %H:%M")
-
-        # Uložení fotografií.
-        ulozene_fotky = []
-
-        fotografie = request.files.getlist("fotografie")
-
-        for fotografie_soubor in fotografie:
-
-            if fotografie_soubor and fotografie_soubor.filename:
-
-                puvodni_nazev = secure_filename(fotografie_soubor.filename)
-
-                pripona = os.path.splitext(puvodni_nazev)[1].lower()
-
-                if not pripona:
-                    pripona = ".jpg"
-
-                novy_nazev = (
-                    datetime.now().strftime("%Y%m%d_%H%M%S")
-                    + "_"
-                    + uuid.uuid4().hex[:8]
-                    + pripona
-                )
-
-                cesta = os.path.join(
-                    app.config["UPLOAD_FOLDER"],
-                    novy_nazev
-                )
-
-                fotografie_soubor.save(cesta)
-
-                ulozene_fotky.append(novy_nazev)
-
-        print("")
-        print("======================================")
-        print("NOVÁ OPRAVA")
-        print("======================================")
-        print("Nahlásil:", uzivatel["jmeno"])
-        print("Datum:", datum)
-        print("Stroj:", stroj)
-        print("Závada:", zavada)
-        print("Provedeno:", provedeno)
-        print("Fotografie:", len(ulozene_fotky))
-
-        for fotka in ulozene_fotky:
-            print(" -", fotka)
-
-        print("======================================")
-        print("")
-
-        # Odeslání push upozornění všem ostatním zaregistrovaným uživatelům.
-        odesli_push_vsem_ostatnim(
-            session["uzivatel"],
-            stroj,
-            zavada
+        row = execute_returning(
+            """
+            INSERT INTO repairs (
+                machine,
+                problem,
+                initial_work,
+                status,
+                reported_by_login,
+                reported_by_name
+            )
+            VALUES (%s, %s, %s, 'nova', %s, %s)
+            RETURNING id
+            """,
+            (
+                stroj,
+                zavada,
+                provedeno,
+                u["login"],
+                u["jmeno"]
+            )
         )
 
-        return """
-        <html lang="cs">
+        repair_id = row["id"]
 
-        <head>
+        uloz_fotky(
+            repair_id,
+            request.files.getlist("fotografie"),
+            phase="zavada"
+        )
 
-            <meta charset="UTF-8">
+        pridej_event(
+            repair_id,
+            "nahlaseno",
+            f"Nahlášena závada: {zavada}"
+        )
 
-            <meta name="viewport"
-                  content="width=device-width, initial-scale=1.0">
+        odesli_push(
+            "🔧 Nová porucha stroje",
+            f"{stroj}: {zavada}",
+            url=f"/oprava/{repair_id}",
+            exclude_login=u["login"]
+        )
 
-            <title>Oprava nahlášena</title>
+        return redirect(
+            url_for(
+                "detail_opravy",
+                repair_id=repair_id
+            )
+        )
 
-            <style>
-
-                body {
-                    font-family: Arial;
-                    background: #f2f2f2;
-                    padding: 20px;
-                }
-
-                .box {
-                    max-width: 600px;
-                    margin: 40px auto;
-                    background: white;
-                    padding: 30px;
-                    border-radius: 15px;
-                    text-align: center;
-                }
-
-                a {
-                    display: block;
-                    background: #333;
-                    color: white;
-                    padding: 15px;
-                    margin-top: 20px;
-                    text-decoration: none;
-                    border-radius: 8px;
-                }
-
-            </style>
-
-        </head>
-
-        <body>
-
-            <div class="box">
-
-                <h1>✅ Oprava nahlášena</h1>
-
-                <p>
-                    Oprava byla přijata.
-                </p>
-
-                <a href="/nahlasit-opravu">
-                    NAHLÁSIT DALŠÍ OPRAVU
-                </a>
-
-                <a href="/hlavni">
-                    ZPĚT NA HLAVNÍ STRÁNKU
-                </a>
-
-            </div>
-
-        </body>
-
-        </html>
-        """
-
-    stroje_html = ""
-
-    for stroj in STROJE:
-        stroje_html += f'<option value="{stroj}">{stroj}</option>'
+    stroje_html = "".join(
+        f'<option value="{escape(stroj)}">{escape(stroj)}</option>'
+        for stroj in STROJE
+    )
 
     return f"""
     <!DOCTYPE html>
     <html lang="cs">
-
     <head>
-
         <meta charset="UTF-8">
 
         <meta name="viewport"
@@ -777,19 +1054,18 @@ def nahlasit_opravu():
         <title>Nahlásit opravu</title>
 
         <style>
-
             body {{
                 font-family: Arial, sans-serif;
                 background: #f2f2f2;
                 margin: 0;
-                padding: 20px;
+                padding: 18px;
             }}
 
             .box {{
-                max-width: 700px;
+                max-width: 720px;
                 margin: 20px auto;
                 background: white;
-                padding: 30px;
+                padding: 26px;
                 border-radius: 15px;
                 box-shadow: 0 3px 15px rgba(0,0,0,0.15);
             }}
@@ -816,7 +1092,7 @@ def nahlasit_opravu():
             }}
 
             textarea {{
-                min-height: 140px;
+                min-height: 130px;
                 resize: vertical;
             }}
 
@@ -870,36 +1146,30 @@ def nahlasit_opravu():
                 color: #555;
                 font-size: 14px;
             }}
-
         </style>
-
     </head>
 
     <body>
-
         <div class="box">
-
             <h1>🔧 Nahlásit opravu</h1>
 
             <p>
                 Nahlásil:
-                <strong>{uzivatel["jmeno"]}</strong>
+                <strong>{escape(u["jmeno"])}</strong>
             </p>
 
-            <form method="POST" enctype="multipart/form-data">
+            <form method="POST"
+                  enctype="multipart/form-data">
 
                 <label>Stroj</label>
 
                 <select name="stroj" required>
-
                     <option value="">
                         -- Vyber stroj --
                     </option>
 
                     {stroje_html}
-
                 </select>
-
 
                 <label>Popis závady</label>
 
@@ -918,15 +1188,15 @@ def nahlasit_opravu():
                     🎤 DIKTOVAT ZÁVADU
                 </button>
 
-                <div id="stav-zavada" class="stav"></div>
+                <div id="stav-zavada"
+                     class="stav"></div>
 
-
-                <label>Co bylo provedeno</label>
+                <label>Co už bylo provedeno</label>
 
                 <textarea
                     id="provedeno"
                     name="provedeno"
-                    placeholder="Sem napište nebo nadiktujte provedenou opravu..."
+                    placeholder="Volitelné – pokud jste už něco udělali..."
                 ></textarea>
 
                 <button
@@ -937,10 +1207,10 @@ def nahlasit_opravu():
                     🎤 DIKTOVAT PROVEDENOU OPRAVU
                 </button>
 
-                <div id="stav-provedeno" class="stav"></div>
+                <div id="stav-provedeno"
+                     class="stav"></div>
 
-
-                <label>Fotografie závady / opravy</label>
+                <label>Fotografie závady</label>
 
                 <input
                     type="file"
@@ -948,155 +1218,1155 @@ def nahlasit_opravu():
                     accept="image/*"
                     capture="environment"
                     multiple
-                    id="fotografie"
                     class="foto-input"
                 >
 
                 <div class="foto-info">
-                    📷 Klepnutím vyfotíte závadu. Můžete přidat více fotografií.
+                    📷 Můžete přidat více fotografií.
                 </div>
-
 
                 <button type="submit">
                     ODESLAT OPRAVU
                 </button>
-
             </form>
 
-            <a class="zpet" href="/hlavni">
+            <a class="zpet"
+               href="/hlavni">
                 ← Zpět
             </a>
-
         </div>
 
-
         <script>
-
             function diktovat(id, tlacitko) {{
+                const pole =
+                    document.getElementById(id);
 
-                const pole = document.getElementById(id);
-
-                const stav = document.getElementById("stav-" + id);
-
+                const stav =
+                    document.getElementById(
+                        "stav-" + id
+                    );
 
                 const SpeechRecognition =
                     window.SpeechRecognition ||
                     window.webkitSpeechRecognition;
 
-
                 if (!SpeechRecognition) {{
-
                     stav.innerHTML =
                         "⚠️ Tento prohlížeč hlasové diktování nepodporuje.";
-
                     return;
                 }}
 
-
-                const recognition = new SpeechRecognition();
+                const recognition =
+                    new SpeechRecognition();
 
                 recognition.lang = "cs-CZ";
-
                 recognition.interimResults = true;
-
                 recognition.continuous = false;
 
+                tlacitko.classList.add(
+                    "posloucham"
+                );
 
-                tlacitko.classList.add("posloucham");
-
-                tlacitko.innerHTML = "🔴 POSLOUCHÁM...";
+                tlacitko.innerHTML =
+                    "🔴 POSLOUCHÁM...";
 
                 stav.innerHTML = "Mluvte...";
 
-
                 let puvodniText = pole.value;
 
+                recognition.onresult =
+                    function(event) {{
+                        let text = "";
 
-                recognition.onresult = function(event) {{
+                        for (
+                            let i = event.resultIndex;
+                            i < event.results.length;
+                            i++
+                        ) {{
+                            text +=
+                                event.results[i][0]
+                                    .transcript;
+                        }}
 
-                    let text = "";
+                        if (
+                            puvodniText.trim() !== ""
+                        ) {{
+                            pole.value =
+                                puvodniText.trim() +
+                                " " +
+                                text;
+                        }} else {{
+                            pole.value = text;
+                        }}
+                    }};
 
-                    for (
-                        let i = event.resultIndex;
-                        i < event.results.length;
-                        i++
-                    ) {{
-
-                        text += event.results[i][0].transcript;
-
-                    }}
-
-
-                    if (puvodniText.trim() !== "") {{
-
-                        pole.value =
-                            puvodniText.trim() + " " + text;
-
-                    }} else {{
-
-                        pole.value = text;
-
-                    }}
-
-                }};
-
-
-                recognition.onerror = function(event) {{
-
-                    stav.innerHTML =
-                        "⚠️ Nepodařilo se použít mikrofon: "
-                        + event.error;
-
-                }};
-
-
-                recognition.onend = function() {{
-
-                    tlacitko.classList.remove("posloucham");
-
-                    tlacitko.innerHTML =
-                        "🎤 DIKTOVAT ZNOVU";
-
-                    if (pole.value.trim() !== "") {{
-
+                recognition.onerror =
+                    function(event) {{
                         stav.innerHTML =
-                            "✅ Text byl vložen.";
+                            "⚠️ Nepodařilo se použít mikrofon: " +
+                            event.error;
+                    }};
 
-                    }} else {{
+                recognition.onend =
+                    function() {{
+                        tlacitko.classList.remove(
+                            "posloucham"
+                        );
 
-                        stav.innerHTML = "";
+                        tlacitko.innerHTML =
+                            "🎤 DIKTOVAT ZNOVU";
 
-                    }}
-
-                }};
-
+                        if (
+                            pole.value.trim() !== ""
+                        ) {{
+                            stav.innerHTML =
+                                "✅ Text byl vložen.";
+                        }} else {{
+                            stav.innerHTML = "";
+                        }}
+                    }};
 
                 recognition.start();
-
             }}
-
         </script>
-
     </body>
-
     </html>
     """
 
 
 # ============================================================
-# ZOBRAZENÍ ULOŽENÝCH FOTOGRAFIÍ
+# SEZNAM OPRAV
 # ============================================================
 
-@app.route("/fotografie/<path:nazev>")
-def fotografie(nazev):
-
-    if "uzivatel" not in session:
+@app.route("/opravy")
+def vsechny_opravy():
+    if not prihlaseny():
         return redirect(url_for("prihlaseni"))
 
-    return send_from_directory(
-        app.config["UPLOAD_FOLDER"],
-        nazev
+    status_filter = request.args.get(
+        "stav",
+        ""
+    ).strip()
+
+    params = []
+    where = ""
+
+    if status_filter in STAVY:
+        where = "WHERE r.status = %s"
+        params.append(status_filter)
+
+    opravy = fetch_all(
+        f"""
+        SELECT
+            r.*,
+            (
+                SELECT COUNT(*)
+                FROM repair_photos p
+                WHERE p.repair_id = r.id
+            ) AS photo_count
+        FROM repairs r
+        {where}
+        ORDER BY
+            CASE r.status
+                WHEN 'nova' THEN 1
+                WHEN 'resi_se' THEN 2
+                ELSE 3
+            END,
+            r.created_at DESC
+        """,
+        tuple(params)
     )
+
+    cards = ""
+
+    for o in opravy:
+        assigned = (
+            escape(o["assigned_to_name"])
+            if o["assigned_to_name"]
+            else "zatím nikdo"
+        )
+
+        cards += f"""
+        <a class="card-link"
+           href="/oprava/{o["id"]}">
+            <div class="card">
+                <div class="top">
+                    <strong>#{o["id"]} · {escape(o["machine"])}</strong>
+                    <span>{stav_html(o["status"])}</span>
+                </div>
+
+                <div class="problem">
+                    {escape(o["problem"])}
+                </div>
+
+                <div class="meta">
+                    Nahlásil: {escape(o["reported_by_name"])}
+                    · {format_datum(o["created_at"])}
+                    <br>
+                    Převzal: {assigned}
+                    · 📷 {o["photo_count"]}
+                </div>
+            </div>
+        </a>
+        """
+
+    if not cards:
+        cards = """
+        <div class="empty">
+            Zatím zde nejsou žádné opravy.
+        </div>
+        """
+
+    return f"""
+    <!DOCTYPE html>
+    <html lang="cs">
+    <head>
+        <meta charset="UTF-8">
+
+        <meta name="viewport"
+              content="width=device-width, initial-scale=1.0">
+
+        <title>Všechny opravy</title>
+
+        <style>
+            body {{
+                font-family: Arial, sans-serif;
+                background: #f2f2f2;
+                margin: 0;
+                padding: 16px;
+            }}
+
+            .wrap {{
+                max-width: 900px;
+                margin: 0 auto;
+            }}
+
+            .head {{
+                background: white;
+                padding: 20px;
+                border-radius: 14px;
+                margin-bottom: 14px;
+            }}
+
+            .filters {{
+                display: grid;
+                grid-template-columns: repeat(4, 1fr);
+                gap: 8px;
+                margin-top: 14px;
+            }}
+
+            .filters a {{
+                text-decoration: none;
+                text-align: center;
+                padding: 10px 6px;
+                border-radius: 8px;
+                background: #eee;
+                color: #222;
+                font-size: 14px;
+            }}
+
+            .card-link {{
+                text-decoration: none;
+                color: inherit;
+            }}
+
+            .card {{
+                background: white;
+                padding: 18px;
+                border-radius: 14px;
+                margin-bottom: 12px;
+                box-shadow: 0 2px 8px rgba(0,0,0,.08);
+            }}
+
+            .top {{
+                display: flex;
+                justify-content: space-between;
+                gap: 10px;
+                font-size: 18px;
+            }}
+
+            .problem {{
+                margin-top: 12px;
+                font-size: 16px;
+            }}
+
+            .meta {{
+                margin-top: 12px;
+                color: #666;
+                font-size: 13px;
+                line-height: 1.5;
+            }}
+
+            .back {{
+                display: inline-block;
+                margin-top: 12px;
+                color: #333;
+            }}
+
+            .empty {{
+                background: white;
+                padding: 30px;
+                border-radius: 14px;
+                text-align: center;
+            }}
+        </style>
+    </head>
+
+    <body>
+        <div class="wrap">
+            <div class="head">
+                <h1>📋 Opravy</h1>
+
+                <div class="filters">
+                    <a href="/opravy">Vše</a>
+                    <a href="/opravy?stav=nova">🔴 Nové</a>
+                    <a href="/opravy?stav=resi_se">🟠 Řeší se</a>
+                    <a href="/opravy?stav=hotovo">🟢 Hotovo</a>
+                </div>
+
+                <a class="back"
+                   href="/hlavni">
+                    ← Hlavní stránka
+                </a>
+            </div>
+
+            {cards}
+        </div>
+    </body>
+    </html>
+    """
+
+
+# ============================================================
+# MOJE OPRAVY
+# ============================================================
+
+@app.route("/moje-opravy")
+def moje_opravy():
+    if not prihlaseny():
+        return redirect(url_for("prihlaseni"))
+
+    u = aktualni_uzivatel()
+
+    opravy = fetch_all(
+        """
+        SELECT *
+        FROM repairs
+        WHERE assigned_to_login = %s
+        ORDER BY
+            CASE status
+                WHEN 'resi_se' THEN 1
+                WHEN 'nova' THEN 2
+                ELSE 3
+            END,
+            created_at DESC
+        """,
+        (u["login"],)
+    )
+
+    rows = ""
+
+    for o in opravy:
+        rows += f"""
+        <a class="card-link"
+           href="/oprava/{o["id"]}">
+            <div class="card">
+                <strong>
+                    #{o["id"]} · {escape(o["machine"])}
+                </strong>
+
+                <span>
+                    {stav_html(o["status"])}
+                </span>
+
+                <p>
+                    {escape(o["problem"])}
+                </p>
+
+                <small>
+                    {format_datum(o["created_at"])}
+                </small>
+            </div>
+        </a>
+        """
+
+    if not rows:
+        rows = """
+        <div class="card">
+            Zatím nemáš převzatou žádnou opravu.
+        </div>
+        """
+
+    return f"""
+    <!DOCTYPE html>
+    <html lang="cs">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport"
+              content="width=device-width, initial-scale=1.0">
+        <title>Moje opravy</title>
+
+        <style>
+            body {{
+                font-family: Arial;
+                background: #f2f2f2;
+                margin: 0;
+                padding: 16px;
+            }}
+
+            .wrap {{
+                max-width: 800px;
+                margin: auto;
+            }}
+
+            .head, .card {{
+                background: white;
+                padding: 18px;
+                border-radius: 14px;
+                margin-bottom: 12px;
+            }}
+
+            .card-link {{
+                text-decoration: none;
+                color: inherit;
+            }}
+
+            .card span {{
+                float: right;
+            }}
+
+            .back {{
+                color: #333;
+            }}
+        </style>
+    </head>
+
+    <body>
+        <div class="wrap">
+            <div class="head">
+                <h1>👨‍🔧 Moje opravy</h1>
+                <a class="back"
+                   href="/hlavni">
+                    ← Hlavní stránka
+                </a>
+            </div>
+
+            {rows}
+        </div>
+    </body>
+    </html>
+    """
+
+
+# ============================================================
+# DETAIL OPRAVY
+# ============================================================
+
+@app.route("/oprava/<int:repair_id>")
+def detail_opravy(repair_id):
+    if not prihlaseny():
+        return redirect(url_for("prihlaseni"))
+
+    u = aktualni_uzivatel()
+
+    oprava = fetch_one(
+        """
+        SELECT *
+        FROM repairs
+        WHERE id = %s
+        """,
+        (repair_id,)
+    )
+
+    if not oprava:
+        return "Oprava nebyla nalezena.", 404
+
+    fotky = fetch_all(
+        """
+        SELECT id, phase, filename, created_at
+        FROM repair_photos
+        WHERE repair_id = %s
+        ORDER BY created_at
+        """,
+        (repair_id,)
+    )
+
+    events = fetch_all(
+        """
+        SELECT *
+        FROM repair_events
+        WHERE repair_id = %s
+        ORDER BY created_at
+        """,
+        (repair_id,)
+    )
+
+    photos_html = ""
+
+    for f in fotky:
+        photos_html += f"""
+        <a href="/foto/{f["id"]}"
+           target="_blank">
+            <img src="/foto/{f["id"]}"
+                 alt="Fotografie opravy">
+        </a>
+        """
+
+    if not photos_html:
+        photos_html = "<p>Žádné fotografie.</p>"
+
+    event_html = ""
+
+    for e in events:
+        event_html += f"""
+        <div class="event">
+            <strong>{escape(e["user_name"])}</strong>
+            · {format_datum(e["created_at"])}
+            <br>
+            {escape(e["note"] or e["event_type"])}
+        </div>
+        """
+
+    assigned = (
+        escape(oprava["assigned_to_name"])
+        if oprava["assigned_to_name"]
+        else "zatím nikdo"
+    )
+
+    action_html = ""
+
+    if oprava["status"] == "nova" and u["role"] == "udrzbar":
+        action_html = f"""
+        <form method="POST"
+              action="/oprava/{repair_id}/prevzit">
+            <button class="take"
+                    type="submit">
+                👨‍🔧 PŘEVZÍT OPRAVU
+            </button>
+        </form>
+        """
+
+    elif (
+        oprava["status"] == "resi_se" and
+        (
+            oprava["assigned_to_login"] == u["login"] or
+            u["role"] == "admin"
+        )
+    ):
+        action_html = f"""
+        <form method="POST"
+              enctype="multipart/form-data"
+              action="/oprava/{repair_id}/dokoncit">
+
+            <label>
+                Co bylo provedeno
+            </label>
+
+            <textarea
+                name="final_work"
+                required
+                placeholder="Popište provedenou opravu..."
+            ></textarea>
+
+            <label>
+                Fotografie po opravě
+            </label>
+
+            <input
+                type="file"
+                name="fotografie"
+                accept="image/*"
+                capture="environment"
+                multiple
+            >
+
+            <button class="finish"
+                    type="submit">
+                ✅ DOKONČIT OPRAVU
+            </button>
+        </form>
+        """
+
+    initial_work_html = ""
+
+    if oprava["initial_work"]:
+        initial_work_html = f"""
+        <div class="section">
+            <h3>Co bylo provedeno při nahlášení</h3>
+            <p>{escape(oprava["initial_work"])}</p>
+        </div>
+        """
+
+    final_work_html = ""
+
+    if oprava["final_work"]:
+        final_work_html = f"""
+        <div class="section">
+            <h3>Výsledek opravy</h3>
+            <p>{escape(oprava["final_work"])}</p>
+        </div>
+        """
+
+    return f"""
+    <!DOCTYPE html>
+    <html lang="cs">
+    <head>
+        <meta charset="UTF-8">
+
+        <meta name="viewport"
+              content="width=device-width, initial-scale=1.0">
+
+        <title>Oprava #{repair_id}</title>
+
+        <style>
+            body {{
+                font-family: Arial;
+                background: #f2f2f2;
+                margin: 0;
+                padding: 16px;
+            }}
+
+            .wrap {{
+                max-width: 850px;
+                margin: auto;
+            }}
+
+            .box {{
+                background: white;
+                padding: 22px;
+                border-radius: 14px;
+                margin-bottom: 12px;
+            }}
+
+            .status {{
+                font-size: 20px;
+                font-weight: bold;
+            }}
+
+            .meta {{
+                color: #666;
+                font-size: 14px;
+                line-height: 1.6;
+            }}
+
+            .section {{
+                border-top: 1px solid #ddd;
+                margin-top: 18px;
+                padding-top: 14px;
+            }}
+
+            .photos {{
+                display: grid;
+                grid-template-columns:
+                    repeat(auto-fill, minmax(120px, 1fr));
+                gap: 8px;
+            }}
+
+            .photos img {{
+                width: 100%;
+                aspect-ratio: 1;
+                object-fit: cover;
+                border-radius: 8px;
+            }}
+
+            .event {{
+                background: #f7f7f7;
+                padding: 10px;
+                border-radius: 8px;
+                margin-bottom: 7px;
+                font-size: 14px;
+            }}
+
+            textarea, input {{
+                width: 100%;
+                box-sizing: border-box;
+                padding: 12px;
+                margin: 7px 0 12px;
+                font-size: 16px;
+            }}
+
+            textarea {{
+                min-height: 120px;
+            }}
+
+            button {{
+                width: 100%;
+                padding: 15px;
+                border: 0;
+                border-radius: 8px;
+                font-size: 17px;
+                cursor: pointer;
+            }}
+
+            .take {{
+                background: #f0a000;
+                color: white;
+            }}
+
+            .finish {{
+                background: #198754;
+                color: white;
+            }}
+
+            .back {{
+                display: inline-block;
+                margin-bottom: 12px;
+                color: #333;
+            }}
+        </style>
+    </head>
+
+    <body>
+        <div class="wrap">
+            <a class="back"
+               href="/opravy">
+                ← Zpět na opravy
+            </a>
+
+            <div class="box">
+                <h1>
+                    #{repair_id} · {escape(oprava["machine"])}
+                </h1>
+
+                <div class="status">
+                    {stav_html(oprava["status"])}
+                </div>
+
+                <p>
+                    <strong>Závada:</strong><br>
+                    {escape(oprava["problem"])}
+                </p>
+
+                <div class="meta">
+                    Nahlásil:
+                    {escape(oprava["reported_by_name"])}
+                    · {format_datum(oprava["created_at"])}
+                    <br>
+
+                    Převzal:
+                    {assigned}
+
+                    {(
+                        " · " + format_datum(oprava["assigned_at"])
+                        if oprava["assigned_at"]
+                        else ""
+                    )}
+
+                    <br>
+
+                    Dokončeno:
+                    {format_datum(oprava["completed_at"])}
+                </div>
+
+                {initial_work_html}
+                {final_work_html}
+
+                <div class="section">
+                    <h3>📷 Fotografie</h3>
+                    <div class="photos">
+                        {photos_html}
+                    </div>
+                </div>
+            </div>
+
+            <div class="box">
+                {action_html}
+            </div>
+
+            <div class="box">
+                <h3>🕓 Historie opravy</h3>
+                {event_html}
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+
+
+@app.route("/oprava/<int:repair_id>/prevzit", methods=["POST"])
+def prevzit_opravu(repair_id):
+    if not prihlaseny():
+        return redirect(url_for("prihlaseni"))
+
+    u = aktualni_uzivatel()
+
+    if u["role"] != "udrzbar":
+        return "Pouze údržbář může převzít opravu.", 403
+
+    conn = db_conn()
+
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE repairs
+                    SET
+                        status = 'resi_se',
+                        assigned_to_login = %s,
+                        assigned_to_name = %s,
+                        assigned_at = NOW()
+                    WHERE id = %s
+                      AND status = 'nova'
+                    RETURNING id, machine, problem
+                    """,
+                    (
+                        u["login"],
+                        u["jmeno"],
+                        repair_id
+                    )
+                )
+
+                row = cur.fetchone()
+
+                if not row:
+                    return (
+                        "Opravu už někdo převzal "
+                        "nebo neexistuje.",
+                        409
+                    )
+
+    finally:
+        conn.close()
+
+    pridej_event(
+        repair_id,
+        "prevzato",
+        f"Opravu převzal {u['jmeno']}."
+    )
+
+    odesli_push(
+        "👨‍🔧 Oprava převzata",
+        f"{row['machine']}: převzal {u['jmeno']}",
+        url=f"/oprava/{repair_id}",
+        exclude_login=u["login"]
+    )
+
+    return redirect(
+        url_for(
+            "detail_opravy",
+            repair_id=repair_id
+        )
+    )
+
+
+@app.route("/oprava/<int:repair_id>/dokoncit", methods=["POST"])
+def dokoncit_opravu(repair_id):
+    if not prihlaseny():
+        return redirect(url_for("prihlaseni"))
+
+    u = aktualni_uzivatel()
+    final_work = request.form.get(
+        "final_work",
+        ""
+    ).strip()
+
+    if not final_work:
+        return "Chybí popis provedené opravy.", 400
+
+    oprava = fetch_one(
+        """
+        SELECT *
+        FROM repairs
+        WHERE id = %s
+        """,
+        (repair_id,)
+    )
+
+    if not oprava:
+        return "Oprava nebyla nalezena.", 404
+
+    if oprava["status"] != "resi_se":
+        return "Tato oprava není ve stavu Řeší se.", 409
+
+    if (
+        u["role"] != "admin" and
+        oprava["assigned_to_login"] != u["login"]
+    ):
+        return "Tuto opravu řeší jiný údržbář.", 403
+
+    execute(
+        """
+        UPDATE repairs
+        SET
+            status = 'hotovo',
+            final_work = %s,
+            completed_at = NOW()
+        WHERE id = %s
+        """,
+        (
+            final_work,
+            repair_id
+        )
+    )
+
+    uloz_fotky(
+        repair_id,
+        request.files.getlist("fotografie"),
+        phase="po_oprave"
+    )
+
+    pridej_event(
+        repair_id,
+        "dokonceno",
+        f"Oprava dokončena. {final_work}"
+    )
+
+    odesli_push(
+        "✅ Oprava dokončena",
+        f"{oprava['machine']}: {final_work}",
+        url=f"/oprava/{repair_id}",
+        exclude_login=u["login"]
+    )
+
+    return redirect(
+        url_for(
+            "detail_opravy",
+            repair_id=repair_id
+        )
+    )
+
+
+# ============================================================
+# FOTOGRAFIE
+# ============================================================
+
+@app.route("/foto/<int:photo_id>")
+def foto(photo_id):
+    if not prihlaseny():
+        return redirect(url_for("prihlaseni"))
+
+    row = fetch_one(
+        """
+        SELECT mime_type, data
+        FROM repair_photos
+        WHERE id = %s
+        """,
+        (photo_id,)
+    )
+
+    if not row:
+        return "Fotografie nebyla nalezena.", 404
+
+    return Response(
+        bytes(row["data"]),
+        mimetype=row["mime_type"]
+    )
+
+
+# ============================================================
+# STROJE / HISTORIE
+# ============================================================
+
+@app.route("/stroje")
+def stroje():
+    if not prihlaseny():
+        return redirect(url_for("prihlaseni"))
+
+    rows = fetch_all(
+        """
+        SELECT
+            machine,
+            COUNT(*) AS total,
+            COUNT(*) FILTER (WHERE status = 'nova') AS nova,
+            COUNT(*) FILTER (WHERE status = 'resi_se') AS resi_se,
+            COUNT(*) FILTER (WHERE status = 'hotovo') AS hotovo
+        FROM repairs
+        GROUP BY machine
+        ORDER BY machine
+        """
+    )
+
+    data = {
+        row["machine"]: row
+        for row in rows
+    }
+
+    cards = ""
+
+    for stroj in STROJE:
+        r = data.get(
+            stroj,
+            {
+                "total": 0,
+                "nova": 0,
+                "resi_se": 0,
+                "hotovo": 0
+            }
+        )
+
+        cards += f"""
+        <a class="card-link"
+           href="/stroj/{escape(stroj)}">
+            <div class="card">
+                <strong>{escape(stroj)}</strong>
+                <span>
+                    Celkem: {r["total"]}
+                    · 🔴 {r["nova"]}
+                    · 🟠 {r["resi_se"]}
+                    · 🟢 {r["hotovo"]}
+                </span>
+            </div>
+        </a>
+        """
+
+    return f"""
+    <!DOCTYPE html>
+    <html lang="cs">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport"
+              content="width=device-width, initial-scale=1.0">
+        <title>Stroje</title>
+
+        <style>
+            body {{
+                font-family: Arial;
+                background: #f2f2f2;
+                margin: 0;
+                padding: 16px;
+            }}
+
+            .wrap {{
+                max-width: 800px;
+                margin: auto;
+            }}
+
+            .head, .card {{
+                background: white;
+                padding: 18px;
+                border-radius: 14px;
+                margin-bottom: 12px;
+            }}
+
+            .card-link {{
+                text-decoration: none;
+                color: inherit;
+            }}
+
+            .card span {{
+                display: block;
+                margin-top: 8px;
+                color: #666;
+            }}
+        </style>
+    </head>
+
+    <body>
+        <div class="wrap">
+            <div class="head">
+                <h1>🏭 Stroje</h1>
+
+                <a href="/hlavni">
+                    ← Hlavní stránka
+                </a>
+            </div>
+
+            {cards}
+        </div>
+    </body>
+    </html>
+    """
+
+
+@app.route("/stroj/<path:nazev>")
+def historie_stroje(nazev):
+    if not prihlaseny():
+        return redirect(url_for("prihlaseni"))
+
+    if nazev not in STROJE:
+        return "Stroj nebyl nalezen.", 404
+
+    rows = fetch_all(
+        """
+        SELECT *
+        FROM repairs
+        WHERE machine = %s
+        ORDER BY created_at DESC
+        """,
+        (nazev,)
+    )
+
+    cards = ""
+
+    for o in rows:
+        cards += f"""
+        <a class="card-link"
+           href="/oprava/{o["id"]}">
+            <div class="card">
+                <strong>
+                    #{o["id"]} · {stav_html(o["status"])}
+                </strong>
+
+                <p>{escape(o["problem"])}</p>
+
+                <small>
+                    {format_datum(o["created_at"])}
+                    · {escape(o["reported_by_name"])}
+                </small>
+            </div>
+        </a>
+        """
+
+    if not cards:
+        cards = """
+        <div class="card">
+            Tento stroj zatím nemá žádný záznam.
+        </div>
+        """
+
+    return f"""
+    <!DOCTYPE html>
+    <html lang="cs">
+    <head>
+        <meta charset="UTF-8">
+
+        <meta name="viewport"
+              content="width=device-width, initial-scale=1.0">
+
+        <title>Historie {escape(nazev)}</title>
+
+        <style>
+            body {{
+                font-family: Arial;
+                background: #f2f2f2;
+                margin: 0;
+                padding: 16px;
+            }}
+
+            .wrap {{
+                max-width: 800px;
+                margin: auto;
+            }}
+
+            .head, .card {{
+                background: white;
+                padding: 18px;
+                border-radius: 14px;
+                margin-bottom: 12px;
+            }}
+
+            .card-link {{
+                text-decoration: none;
+                color: inherit;
+            }}
+        </style>
+    </head>
+
+    <body>
+        <div class="wrap">
+            <div class="head">
+                <h1>🏭 {escape(nazev)}</h1>
+                <a href="/stroje">
+                    ← Zpět na stroje
+                </a>
+            </div>
+
+            {cards}
+        </div>
+    </body>
+    </html>
+    """
 
 
 # ============================================================
@@ -1105,15 +2375,19 @@ def fotografie(nazev):
 
 @app.route("/odhlasit")
 def odhlasit():
-
     session.clear()
-
     return redirect(url_for("prihlaseni"))
 
 
 # ============================================================
 # SPUŠTĚNÍ
 # ============================================================
+
+try:
+    init_db()
+except Exception as exc:
+    print("CHYBA PŘI INICIALIZACI DATABÁZE:", exc)
+
 
 if __name__ == "__main__":
     app.run(debug=True)

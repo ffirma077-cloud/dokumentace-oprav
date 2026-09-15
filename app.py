@@ -150,6 +150,22 @@ def init_db():
                 """)
 
                 cur.execute("""
+                    CREATE TABLE IF NOT EXISTS repair_views (
+                        id BIGSERIAL PRIMARY KEY,
+                        repair_id BIGINT NOT NULL REFERENCES repairs(id) ON DELETE CASCADE,
+                        user_login TEXT NOT NULL,
+                        user_name TEXT NOT NULL,
+                        first_viewed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        UNIQUE (repair_id, user_login)
+                    )
+                """)
+
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_repair_views_repair
+                    ON repair_views(repair_id)
+                """)
+
+                cur.execute("""
                     CREATE INDEX IF NOT EXISTS idx_repairs_status
                     ON repairs(status)
                 """)
@@ -1829,6 +1845,39 @@ def detail_opravy(repair_id):
             "← Zpět na opravy"
         ), 404
 
+    execute(
+        """
+        INSERT INTO repair_views
+            (repair_id, user_login, user_name)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (repair_id, user_login) DO NOTHING
+        """,
+        (repair_id, u["login"], u["jmeno"])
+    )
+
+    zobrazeni = fetch_all(
+        """
+        SELECT user_name, first_viewed_at
+        FROM repair_views
+        WHERE repair_id = %s
+        ORDER BY first_viewed_at
+        """,
+        (repair_id,)
+    )
+
+    views_html = ""
+
+    for z in zobrazeni:
+        views_html += f"""
+        <div class="view-row">
+            <strong>👁️ {escape(z["user_name"])}</strong>
+            <span>{format_datum(z["first_viewed_at"])}</span>
+        </div>
+        """
+
+    if not views_html:
+        views_html = "<p>Zatím nikdo.</p>"
+
     fotky = fetch_all(
         """
         SELECT id, phase, filename, created_at
@@ -2010,6 +2059,24 @@ def detail_opravy(repair_id):
                 line-height: 1.6;
             }}
 
+            .view-row {{
+                display: flex;
+                justify-content: space-between;
+                gap: 12px;
+                padding: 9px 0;
+                border-bottom: 1px solid #eee;
+                font-size: 14px;
+            }}
+
+            .view-row:last-child {{
+                border-bottom: 0;
+            }}
+
+            .view-row span {{
+                color: #666;
+                white-space: nowrap;
+            }}
+
             .section {{
                 border-top: 1px solid #ddd;
                 margin-top: 18px;
@@ -2125,7 +2192,12 @@ def detail_opravy(repair_id):
                     {format_datum(oprava["completed_at"])}
                 </div>
 
-                {initial_work_html}
+                <div class="section">
+                <h3>👁️ Zobrazeno</h3>
+                {views_html}
+            </div>
+
+            {initial_work_html}
                 {final_work_html}
 
                 <div class="section">

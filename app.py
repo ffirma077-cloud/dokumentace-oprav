@@ -1,5 +1,6 @@
 from flask import Flask, request, redirect, url_for, session, jsonify, send_file, Response
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from werkzeug.utils import secure_filename
 from html import escape
 from io import BytesIO
@@ -260,7 +261,10 @@ def format_datum(value):
     if not value:
         return "—"
 
-    return value.astimezone().strftime("%d.%m.%Y %H:%M")
+    # Všechny časy zobrazujeme v českém časovém pásmu.
+    # Europe/Prague automaticky řeší letní i zimní čas.
+    cesky_cas = value.astimezone(ZoneInfo("Europe/Prague"))
+    return cesky_cas.strftime("%d.%m.%Y %H:%M")
 
 
 def stav_html(status):

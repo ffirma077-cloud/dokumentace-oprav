@@ -732,9 +732,15 @@ def hlavni_stranka():
             <h2>Přehled oprav</h2>
 
             <div class="stat-grid">
-                <div class="stat"><strong>🔴 {nova}</strong><span>Nové</span></div>
-                <div class="stat"><strong>🟠 {resi}</strong><span>Řeší se</span></div>
-                <div class="stat"><strong>🟢 {hotovo}</strong><span>Hotovo</span></div>
+                <a class="stat-link" href="/opravy?stav=nova" aria-label="Zobrazit nové opravy">
+                    <div class="stat"><strong>🔴 {nova}</strong><span>Nové</span><small>Zobrazit opravy</small></div>
+                </a>
+                <a class="stat-link" href="/opravy?stav=resi_se" aria-label="Zobrazit opravy, které se řeší">
+                    <div class="stat"><strong>🟠 {resi}</strong><span>Řeší se</span><small>Zobrazit opravy</small></div>
+                </a>
+                <a class="stat-link" href="/opravy?stav=hotovo" aria-label="Zobrazit hotové opravy">
+                    <div class="stat"><strong>🟢 {hotovo}</strong><span>Hotovo</span><small>Zobrazit opravy</small></div>
+                </a>
             </div>
 
             <a href="/opravy"><button>📋 VŠECHNY OPRAVY</button></a>
@@ -745,9 +751,15 @@ def hlavni_stranka():
             <h2>Údržba</h2>
 
             <div class="stat-grid">
-                <div class="stat"><strong>🔴 {nova}</strong><span>Nové</span></div>
-                <div class="stat"><strong>🟠 {resi}</strong><span>Řeší se</span></div>
-                <div class="stat"><strong>🟢 {hotovo}</strong><span>Hotovo</span></div>
+                <a class="stat-link" href="/opravy?stav=nova" aria-label="Zobrazit nové opravy">
+                    <div class="stat"><strong>🔴 {nova}</strong><span>Nové</span><small>Zobrazit opravy</small></div>
+                </a>
+                <a class="stat-link" href="/opravy?stav=resi_se" aria-label="Zobrazit opravy, které se řeší">
+                    <div class="stat"><strong>🟠 {resi}</strong><span>Řeší se</span><small>Zobrazit opravy</small></div>
+                </a>
+                <a class="stat-link" href="/opravy?stav=hotovo" aria-label="Zobrazit hotové opravy">
+                    <div class="stat"><strong>🟢 {hotovo}</strong><span>Hotovo</span><small>Zobrazit opravy</small></div>
+                </a>
             </div>
 
             <a href="/nahlasit-opravu">
@@ -813,11 +825,30 @@ def hlavni_stranka():
                 margin: 18px 0;
             }}
 
+            .stat-link {{
+                display: block;
+                color: inherit;
+                border-radius: 10px;
+            }}
+
             .stat {{
                 background: #f6f6f6;
                 border-radius: 10px;
                 padding: 14px 8px;
                 text-align: center;
+                cursor: pointer;
+                transition: transform .12s ease, box-shadow .12s ease, background .12s ease;
+                min-height: 72px;
+            }}
+
+            .stat:hover {{
+                background: #eeeeee;
+                box-shadow: 0 2px 8px rgba(0,0,0,.10);
+                transform: translateY(-1px);
+            }}
+
+            .stat:active {{
+                transform: scale(.98);
             }}
 
             .stat strong {{
@@ -829,6 +860,13 @@ def hlavni_stranka():
                 display: block;
                 margin-top: 5px;
                 font-size: 13px;
+            }}
+
+            .stat small {{
+                display: block;
+                margin-top: 6px;
+                font-size: 11px;
+                color: #666;
             }}
 
             .notifikace-box {{
